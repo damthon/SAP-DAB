@@ -1,0 +1,302 @@
+# -*- coding: utf-8 -*-
+"""
+Combine, en un point de référence commun (typiquement le centre de gravité
+de la section composite dalle + poutre principale), les efforts issus :
+    - d'un Section Cut "Design Slab" sur la dalle (cf. createSectionCutsSAP2000
+      / bridgeDeckSectionCutsSAP2000 / getSectionCutForcesSAP2000, package
+      SectionCuts) ;
+    - d'un Frame Object représentant la poutre principale (résultats natifs
+      SapModel.Results.FrameForce, cf. OutputDesign/frameSectionForces.py).
+
+Pourquoi ne PAS réutiliser tel quel le transport par Delta_location de
+getSectionCutForcesSAP2000.py :
+    getSectionCutForcesSAP2000.SetResultLocation applique le décalage
+    Delta_location=[d2,d3] directement aux coordonnées GLOBALES Y et Z
+    (Y += d2, Z += d3), ce qui n'est rigoureusement exact QUE si l'axe local
+    1 du Section Cut est aligné sur l'axe global X (auquel cas l'axe local 2
+    coïncide avec Y global et l'axe local 3 avec Z global). Sur un tablier
+    courbe ou biais, l'axe local 1 (tangente) n'est PAS aligné sur X global
+    (cf. SC_angles calculé par createSectionCutsSAP2000/bridgeDeckSectionCuts
+    SAP2000 précisément pour capturer cette rotation) : appliquer d2/d3
+    directement à Y/Z global serait donc une erreur de transport pour ce
+    projet (tablier courbe, cf. axe tablier.xlsx).
+
+    Ce module transporte au contraire les efforts en repère GLOBAL, par un
+    produit vectoriel classique, valable quelle que soit l'orientation du
+    Section Cut ou du Frame Object :
+
+        M_nouveau_point = M_ancien_point + F_global x (point_nouveau - point_ancien)
+
+    (vérifié analytiquement en fin de fichier, cf. _self_check_transport).
+
+Convention d'axes retenue pour le REPÈRE LOCAL DU TABLIER (utilisé pour
+ré-exprimer le résultat final de façon lisible, indépendamment de la
+numérotation d'axes locaux 2/3 propre à SAP2000, qui DIFFÈRE entre un
+Section Cut "Design Slab" et un Frame Object, cf. point critique ci-dessous) :
+    e_L : tangente à l'axe du tablier (longitudinal)
+    e_T : transversale horizontale (perpendiculaire à e_L, dans le plan XY)
+    e_V : verticale = (0,0,1) global
+
+Point critique vérifié (à ne pas mélanger) :
+    - Section Cut "Design Slab" (SetLocalAxesAngleDesign, angle = angle entre
+      X global et l'axe local 1) : axe local 3 = VERTICAL (global Z) et axe
+      local 2 = TRANSVERSE horizontal (hypothèse déduite de la sémantique de
+      GetResultsSide pour ce type, "Right/Left" ; À VÉRIFIER visuellement
+      dans SAP2000 - afficher les axes locaux du Section Cut - avant tout
+      usage en production, cf. recommandations de la note de méthode).
+    - Frame Object "poutre" (axe local 1 le long de l'élément) : convention
+      SAP2000 par défaut pour un élément proche de l'horizontale -> axe
+      local 2 tend vers la VERTICALE, axe local 3 est transverse horizontal.
+      C'est l'INVERSE du Section Cut ci-dessus (2 <-> 3 échangés). Cohérent
+      avec ce projet : OutputDesign/frameSectionForces.py et
+      PostTraitement/get_Frame_Force.py utilisent tous deux M3 (indice 13 du
+      tuple Results.FrameForce) comme moment de flexion "principal" des
+      poutres longitudinales - donc M3 (Frame) = flexion verticale, comme M2
+      (Section Cut Design Slab).
+    Ce module ne se fie PAS à un numéro d'axe fixe : il reconstruit le
+    repère global réel de chaque objet (matrice de transformation SAP2000
+    pour le Frame, reconstruction géométrique documentée pour le Section
+    Cut) puis reprojette sur (e_L, e_T, e_V) - la confusion 2/3 ci-dessus ne
+    peut donc pas se propager silencieusement dans le résultat final.
+"""
+
+import numpy as np
+
+
+# ---------------------------------------------------------------------------
+# Repères locaux des deux objets, en coordonnées globales
+# ---------------------------------------------------------------------------
+
+def frame_local_axes_global(SapModel, frame_name):
+    """
+    Vecteurs unitaires des axes locaux 1,2,3 du Frame Object `frame_name`,
+    exprimés en repère global, via SapModel.FrameObj.GetTransformationMatrix
+    (matrice de 9 cosinus directeurs, [Global] = M @ [Local]).
+
+    Un contrôle d'orthonormalité (R^T R = I, det = +1) est effectué ; si le
+    premier remplissage (ligne par ligne) échoue, la transposée est essayée
+    automatiquement avant d'abandonner - filet de sécurité pour un point de
+    l'API (ordre de remplissage des 9 valeurs) qui n'est pas illustré par un
+    exemple VBA exploitable dans la documentation disponible.
+
+    Output: e1, e2, e3 (np.array de dimension 3 chacun)
+    """
+    value, ret = SapModel.FrameObj.GetTransformationMatrix(frame_name)
+    if ret != 0:
+        raise RuntimeError(f"GetTransformationMatrix a échoué pour '{frame_name}' (ret={ret}).")
+
+    def _ortho_error(R):
+        return np.max(np.abs(R.T @ R - np.eye(3)))
+
+    R_row_major = np.array(value).reshape(3, 3)
+    if _ortho_error(R_row_major) < 1e-6:
+        R = R_row_major
+    elif _ortho_error(R_row_major.T) < 1e-6:
+        R = R_row_major.T
+    else:
+        raise RuntimeError(
+            f"Matrice de transformation non orthonormale pour '{frame_name}' "
+            f"(erreur={_ortho_error(R_row_major):.2e}) : vérifier l'ordre de "
+            f"remplissage des 9 cosinus directeurs retournés par l'API."
+        )
+    return R[:, 0], R[:, 1], R[:, 2]
+
+
+def section_cut_local_axes_global(sc_angle_deg):
+    """
+    Vecteurs unitaires des axes locaux 1,2,3 d'un Section Cut "Design Slab",
+    reconstruits à partir de son seul angle SetLocalAxesAngleDesign (angle
+    signé, en degrés, de l'axe global X vers l'axe local 1, dans le plan
+    horizontal - cf. vg.signed_angle(X_vector, tangent, look=Z) utilisé par
+    createSectionCutsSAP2000/bridgeDeckSectionCutsSAP2000), SOUS L'HYPOTHÈSE
+    (cf. docstring de module, à vérifier visuellement dans SAP2000) que l'axe
+    local 3 est vertical (global Z) pour ce type de coupe.
+
+    Output: e1, e2, e3 (np.array de dimension 3 chacun)
+    """
+    theta = np.radians(sc_angle_deg)
+    e1 = np.array([np.cos(theta), np.sin(theta), 0.0])
+    e3 = np.array([0.0, 0.0, 1.0])
+    e2 = np.cross(e3, e1)
+    return e1, e2, e3
+
+
+def bridge_local_frame(tangent_global):
+    """
+    Repère local du tablier (e_L, e_T, e_V) à une station donnée, à partir
+    de la tangente (vecteur global, pas nécessairement unitaire) à l'axe du
+    tablier en ce point. e_V = verticale globale fixe ; e_T complète un
+    repère direct dans le plan horizontal.
+
+    Accepte une tangente 2D (X,Y) OU 3D (X,Y,Z) : de nombreux projets (cf.
+    convention CLAUDE.md - tracés fournis en colonnes X,Y uniquement, sans Z)
+    calculent cette tangente à partir d'une polyligne purement horizontale.
+    Une tangente 2D est complétée par une composante Z=0 (tablier supposé
+    localement horizontal en plan) pour que e_L reste bien un vecteur 3D,
+    cohérent avec e_T et e_V ci-dessous (sinon les torseurs global/local
+    combinés plus loin dans ce module échouent avec un désaccord de forme
+    3 vs 2, np.dot(F_global, e_L) notamment).
+    """
+    e_L = np.asarray(tangent_global, dtype=float)
+    if e_L.shape[-1] == 2:
+        e_L = np.append(e_L, 0.0)
+    e_L = e_L / np.linalg.norm(e_L)
+    e_V = np.array([0.0, 0.0, 1.0])
+    e_T = np.cross(e_V, e_L)
+    norm_T = np.linalg.norm(e_T)
+    if norm_T < 1e-9:
+        raise ValueError("Tangente verticale : repère transversal indéfini.")
+    e_T = e_T / norm_T
+    return e_L, e_T, e_V
+
+
+# ---------------------------------------------------------------------------
+# Transport rigoureux force + moment (repère global)
+# ---------------------------------------------------------------------------
+
+def local_to_global_force_moment(P, V2, V3, T, M2, M3, e1, e2, e3):
+    """Convertit (P,V2,V3,T,M2,M3), exprimés dans le repère local (e1,e2,e3)
+    d'un objet SAP2000, en un torseur (F_global, M_global) en repère global."""
+    F_local = np.array([P, V2, V3])
+    M_local = np.array([T, M2, M3])
+    R = np.column_stack([e1, e2, e3])   # [Global] = R @ [Local]
+    return R @ F_local, R @ M_local
+
+
+def transport_to_point(F_global, M_global_at_point, point_from, point_to):
+    """
+    Transporte le torseur (F_global, M_global_at_point), calculé au point
+    `point_from`, au point `point_to` (tous deux en coordonnées globales).
+
+        M_nouveau = M_ancien + F_global x (point_to - point_from)
+
+    F_global est inchangé par un transport (une résultante de force ne
+    dépend pas du point auquel on l'exprime, seul le moment en dépend).
+    """
+    r = np.asarray(point_to, dtype=float) - np.asarray(point_from, dtype=float)
+    return F_global, np.asarray(M_global_at_point) + np.cross(F_global, r)
+
+
+def global_to_bridge_frame(F_global, M_global, e_L, e_T, e_V):
+    """Reprojette un torseur global sur le repère du tablier (e_L,e_T,e_V) et
+    retourne un dict aux noms physiques explicites (cf. docstring de module,
+    aucune référence à une numérotation d'axe locale 2/3)."""
+    return {
+        "P": float(np.dot(F_global, e_L)),
+        "V_transverse": float(np.dot(F_global, e_T)),
+        "V_vertical": float(np.dot(F_global, e_V)),
+        "T": float(np.dot(M_global, e_L)),
+        "M_transverse_bending": float(np.dot(M_global, e_V)),   # flexion "en plan"
+        "M_vertical_bending": float(np.dot(M_global, e_T)),     # flexion principale (fibre sup/inf)
+    }
+
+
+# ---------------------------------------------------------------------------
+# Composition dalle + poutre au centre de gravité composite
+# ---------------------------------------------------------------------------
+
+def composite_centroid_local(slab_area, slab_z, slab_y_offset,
+                              beam_area, beam_z, modular_ratio=1.0):
+    """
+    Centre de gravité de la section composite (dalle + poutre), dans le plan
+    transversal-vertical LOCAL (y' = transverse, z' = vertical) centré sur
+    l'axe propre de la poutre (y'=0), avec la dalle homogénéisée par un
+    coefficient d'équivalence modular_ratio = E_dalle / E_poutre (1.0 si
+    même matériau : centre de gravité géométrique simple).
+
+    Input:
+        slab_area : aire de la bande de dalle de largeur efficace beff (m²)
+        slab_z : cote (z') du plan moyen de la dalle, relative à l'axe de la
+            poutre (m) - dans ce projet, z=0 en tête de tablier, dalle à
+            z = -épaisseur_dalle/2 (cf. CLAUDE.md)
+        slab_y_offset : décalage transversal du centre de la bande de dalle
+            par rapport à l'axe de la poutre, (beff_2 - beff_1)/2 (m)
+        beam_area, beam_z : aire et cote du centre de gravité PROPRE de la
+            poutre (m², m) - à fournir explicitement (dépend du point
+            d'insertion réel de la poutre, cf. FrameObj.SetInsertionPoint_1,
+            non ré-interrogé automatiquement ici, cf. note de méthode)
+        modular_ratio : E_dalle / E_poutre (défaut 1.0)
+
+    Output: (y_c, z_c) - centre de gravité composite, mêmes coordonnées
+        locales (transverse, vertical) que les entrées
+    """
+    a_slab_eq = slab_area * modular_ratio
+    w_total = a_slab_eq + beam_area
+    if w_total <= 0:
+        raise ValueError("Aire composite nulle ou négative.")
+    y_c = (a_slab_eq * slab_y_offset + beam_area * 0.0) / w_total
+    z_c = (a_slab_eq * slab_z + beam_area * beam_z) / w_total
+    return y_c, z_c
+
+
+def combine_slab_beam_forces(
+    slab_forces_local, slab_point_global, slab_angle_deg,
+    beam_forces_local, beam_point_global, beam_frame_name, SapModel,
+    target_point_global, tangent_global,
+):
+    """
+    Combine, au point `target_point_global`, les efforts de la dalle (Section
+    Cut Design Slab) et de la poutre (Frame Object), tous deux transportés en
+    repère global puis sommés, et ré-exprimés dans le repère du tablier
+    (e_L, e_T, e_V) à cette station.
+
+    Input:
+        slab_forces_local : (P,V2,V3,T,M2,M3) du Section Cut, REPÈRE LOCAL du
+            cut (sortie de getSectionCutForcesSAP2000, une ligne = un
+            output_type donné, cf. orchestrateur)
+        slab_point_global : (X,Y,Z) global auquel slab_forces_local est
+            rapporté (sortie X,Y,Z de getSectionCutForcesSAP2000)
+        slab_angle_deg : angle SetLocalAxesAngleDesign du Section Cut (deg)
+        beam_forces_local : (P,V2,V3,T,M2,M3) du Frame Object, REPÈRE LOCAL
+            du frame (sortie SapModel.Results.FrameForce)
+        beam_point_global : (X,Y,Z) global de la station du Frame Object à
+            laquelle beam_forces_local est rapporté
+        beam_frame_name : nom du Frame Object (pour interroger sa matrice de
+            transformation réelle, cf. frame_local_axes_global)
+        SapModel : objet SAP2000
+        target_point_global : (X,Y,Z) du point de report final (typiquement
+            le centre de gravité composite, cf. composite_centroid_local +
+            reconversion en coordonnées globales par l'appelant)
+        tangent_global : tangente locale à l'axe du tablier à cette station
+            (pour construire le repère (e_L,e_T,e_V) de sortie)
+
+    Output: dict aux clés P, V_transverse, V_vertical, T,
+        M_transverse_bending, M_vertical_bending (repère du tablier, cf.
+        global_to_bridge_frame), plus F_global/M_global bruts pour traçabilité.
+    """
+    e1_sc, e2_sc, e3_sc = section_cut_local_axes_global(slab_angle_deg)
+    F_slab, M_slab = local_to_global_force_moment(*slab_forces_local, e1_sc, e2_sc, e3_sc)
+    F_slab, M_slab = transport_to_point(F_slab, M_slab, slab_point_global, target_point_global)
+
+    e1_fr, e2_fr, e3_fr = frame_local_axes_global(SapModel, beam_frame_name)
+    F_beam, M_beam = local_to_global_force_moment(*beam_forces_local, e1_fr, e2_fr, e3_fr)
+    F_beam, M_beam = transport_to_point(F_beam, M_beam, beam_point_global, target_point_global)
+
+    F_total = F_slab + F_beam
+    M_total = M_slab + M_beam
+
+    e_L, e_T, e_V = bridge_local_frame(tangent_global)
+    result = global_to_bridge_frame(F_total, M_total, e_L, e_T, e_V)
+    result["F_global"] = F_total
+    result["M_global"] = M_total
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Auto-vérification de la formule de transport (exécutée à l'import)
+# ---------------------------------------------------------------------------
+
+def _self_check_transport():
+    """Vérifie M_nouveau = M_ancien + F x (point_to - point_from) sur un cas
+    simple analytique : force verticale F=(0,0,-P) appliquée en O=(0,0,0),
+    aucun couple. Moment attendu en O'=(d,0,0) : (0,-d*P,0) (cf. note de
+    méthode jointe à la réponse pour la dérivation)."""
+    P, d = 100.0, 3.0
+    F = np.array([0.0, 0.0, -P])
+    M_O = np.array([0.0, 0.0, 0.0])
+    _, M_Op = transport_to_point(F, M_O, [0, 0, 0], [d, 0, 0])
+    expected = np.array([0.0, -d * P, 0.0])
+    assert np.allclose(M_Op, expected), f"Transport incorrect : {M_Op} != {expected}"
+
+
+_self_check_transport()
