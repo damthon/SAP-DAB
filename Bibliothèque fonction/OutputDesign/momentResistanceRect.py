@@ -25,7 +25,7 @@ def momentResistanceRect(Beam_Dim,A_s,Material_Prop,Factors):
     eta_t = Factors[2] 
     
     # Design compressive strength of concrete
-    eta_fc = min(1,(30/f_ck)**(1/3)) # SIA 262 4.2.1.2
+    eta_fc = min(1,(40/f_ck)**(1/3)) # SIA 262:2025 4.2.1.2, eq. (26)
     f_cd = eta_fc*eta_t*f_ck/gamma_c
     
     # Design yield strength of the rebars
