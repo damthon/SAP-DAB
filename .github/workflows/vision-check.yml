@@ -1,0 +1,67 @@
+# À copier dans .github/workflows/vision-check.yml de chaque dépôt supervisé
+# (SectionAnalysis, PunchingAnalysis, SAP-DAB).
+#
+# À chaque poussée / PR : contrôles déterministes de la charte damthon/Vision
+# sur l'état du dépôt (la branche en cours) et des deux autres (branche par
+# défaut). Échoue si un invariant transverse est rompu.
+#
+# Secret à créer dans le dépôt : VISION_TOKEN (Contents read sur les 4 dépôts).
+# Optionnel : VISION_DISPATCH=true (variable de dépôt) pour déclencher aussi
+# l'audit complet par Claude après chaque poussée sur la branche par défaut
+# (VISION_TOKEN doit alors avoir Contents read/write sur damthon/Vision).
+
+name: Vision
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  invariants:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Charte
+        uses: actions/checkout@v4
+        with:
+          repository: damthon/Vision
+          token: ${{ secrets.VISION_TOKEN }}
+          path: vision
+
+      - name: Ce dépôt (branche en cours)
+        uses: actions/checkout@v4
+        with:
+          path: vision/repos/${{ github.event.repository.name }}
+
+      - name: Autres dépôts (branche par défaut)
+        env:
+          GH_TOKEN: ${{ secrets.VISION_TOKEN }}
+          SELF: ${{ github.event.repository.name }}
+        run: |
+          for r in SectionAnalysis PunchingAnalysis SAP-DAB; do
+            [ "${r,,}" = "${SELF,,}" ] && continue
+            git clone --quiet --depth 1 \
+              "https://x-access-token:${GH_TOKEN}@github.com/damthon/${r}.git" "vision/repos/${r}"
+          done
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Invariants transverses
+        working-directory: vision
+        run: |
+          set -o pipefail
+          python tools/check_invariants.py --repos repos | tee -a "$GITHUB_STEP_SUMMARY"
+
+  dispatch:
+    needs: invariants
+    if: always() && vars.VISION_DISPATCH == 'true' && github.event_name == 'push' && github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    steps:
+      - name: Déclencher l'audit complet
+        env:
+          GH_TOKEN: ${{ secrets.VISION_TOKEN }}
+        run: |
+          gh api repos/damthon/Vision/dispatches -f event_type=satellite-push \
+            -F client_payload[repo]="${{ github.event.repository.name }}" \
+            -F client_payload[sha]="${{ github.sha }}"
